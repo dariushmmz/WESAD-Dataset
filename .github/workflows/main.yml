@@ -1,5 +1,4 @@
-<<<<<<< HEAD
-name: انتقال فایل به گیت هاب
+name: Donwload from kaggle
 
 on:
   workflow_dispatch:
@@ -77,7 +76,7 @@ jobs:
           fi
 
           
-          ARCHIVE_PREFIX="sci-hub.ir_"
+          ARCHIVE_PREFIX="dariushmmz_"
 
           
           FULL_ARCHIVE_NAME="${ARCHIVE_PREFIX}${FILENAME_BASE}"
@@ -192,6 +191,3 @@ jobs:
           else
             echo "No changes to commit or push."
           fi
-=======
-
->>>>>>> 156eae4601a22f9a66abc36d37587653152f6407
