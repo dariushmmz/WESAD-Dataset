@@ -1,0 +1,352 @@
+name: Upload File to S3 Storage
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: 'Direct file URL to download'
+        required: true
+        type: string
+      zip_password:
+        description: 'Password for encrypted archive'
+        required: true
+        type: string
+      delete_old_archives:
+        description: 'Delete previous files from S3 bucket'
+        required: false
+        type: boolean
+        default: false
+      bucket_name:
+        description: 'S3 bucket name (e.g., my-bucket)'
+        required: true
+        type: string
+        default: 'c194791'
+      max_file_size_mb:
+        description: 'Maximum size per chunk in MB (e.g., 500 for 500MB chunks)'
+        required: false
+        type: string
+        default: '500'
+
+permissions:
+  contents: read
+
+jobs:
+  download-and-upload-to-s3:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Install dependencies
+        id: install_deps
+        run: |
+          echo "========================================="
+          echo "Installing dependencies..."
+          echo "========================================="
+          
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full
+          
+          # Install s5cmd
+          curl -L -o s5cmd.tar.gz https://github.com/peak/s5cmd/releases/download/v2.2.2/s5cmd_2.2.2_Linux-64bit.tar.gz
+          tar -xzf s5cmd.tar.gz
+          sudo mv s5cmd /usr/local/bin/
+          rm s5cmd.tar.gz
+          
+          echo "✓ Dependencies installed"
+          s5cmd -v 2>/dev/null || s5cmd version 2>/dev/null;
+
+      - name: Configure S3 credentials
+        run: |
+          mkdir -p ~/.aws
+          cat > ~/.aws/credentials << EOF
+          [default]
+          aws_access_key_id = ${{ secrets.S3_ACCESS_KEY }}
+          aws_secret_access_key = ${{ secrets.S3_SECRET_KEY }}
+          EOF
+          echo "S3 credentials configured"
+
+      - name: Test S3 connection
+        run: |
+          echo "Testing S3 connection to bucket: ${{ github.event.inputs.bucket_name }}"
+          ENDPOINT_URL="${{ secrets.S3_ENDPOINT_URL }}"
+          BUCKET_NAME="${{ github.event.inputs.bucket_name }}"
+          
+          # Test if bucket exists and we have access (with trailing slash)
+          if s5cmd --endpoint-url "$ENDPOINT_URL" ls "s3://$BUCKET_NAME/" 2>&1; then
+            echo "✓ Successfully connected to bucket"
+          else
+            echo "❌ Failed to access bucket. Please check:"
+            echo "  1. Bucket '$BUCKET_NAME' exists"
+            echo "  2. Credentials have write permission"
+            echo "  3. Endpoint URL is correct: $ENDPOINT_URL"
+            exit 1
+          fi
+
+      - name: Delete old archives from S3 (if requested)
+        if: ${{ github.event.inputs.delete_old_archives == 'true' }}
+        run: |
+          echo "Deleting old archive files from S3 bucket: ${{ github.event.inputs.bucket_name }}"
+          
+          # Use proper S3 URI with trailing slash for listing
+          s5cmd --endpoint-url ${{ secrets.S3_ENDPOINT_URL }} ls "s3://${{ github.event.inputs.bucket_name }}/" | grep -E '\.7z(\.|$)' | awk '{print $4}' | while read -r file; do
+            echo "Deleting: $file"
+            s5cmd --endpoint-url ${{ secrets.S3_ENDPOINT_URL }} rm "$file"
+          done
+          
+          echo "Old archive files deleted from S3"
+
+      - name: Download file
+        id: download_file
+        run: |
+          curl -L --fail --retry 3 -o downloaded_file "${{ github.event.inputs.file_url }}"
+          FILE_SIZE=$(stat -c%s downloaded_file)
+          FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
+          echo "File downloaded. Size: ${FILE_SIZE_MB} MB"
+          echo "downloaded_file_name=downloaded_file" >> $GITHUB_OUTPUT
+          echo "file_size_mb=${FILE_SIZE_MB}" >> $GITHUB_OUTPUT
+
+      - name: Extract and sanitize filename
+        id: get_filename
+        run: |
+          DOWNLOADED_FILE="${{ steps.download_file.outputs.downloaded_file_name }}"
+          ORIGINAL_URL="${{ github.event.inputs.file_url }}"
+          FILE_SIZE_MB="${{ steps.download_file.outputs.file_size_mb }}"
+          MAX_SIZE_MB="${{ github.event.inputs.max_file_size_mb }}"
+          
+          # Calculate optimal number of parts (aim for 2-3 files)
+          if [[ $FILE_SIZE_MB -le $MAX_SIZE_MB ]]; then
+            NUM_PARTS=1
+            PART_SIZE_MB=$FILE_SIZE_MB
+          else
+            # Aim for 3 files, but ensure each is under max size
+            NUM_PARTS=3
+            PART_SIZE_MB=$((FILE_SIZE_MB / NUM_PARTS))
+            
+            # If parts would be too big, increase number of parts
+            if [[ $PART_SIZE_MB -gt $MAX_SIZE_MB ]]; then
+              NUM_PARTS=$(( (FILE_SIZE_MB + MAX_SIZE_MB - 1) / MAX_SIZE_MB ))
+              PART_SIZE_MB=$((FILE_SIZE_MB / NUM_PARTS))
+            fi
+          fi
+          
+          # Ensure at least 1 part, at most 5 parts
+          if [[ $NUM_PARTS -lt 1 ]]; then NUM_PARTS=1; fi
+          if [[ $NUM_PARTS -gt 5 ]]; then NUM_PARTS=5; fi
+          
+          echo "File size: ${FILE_SIZE_MB} MB"
+          echo "Target max chunk size: ${MAX_SIZE_MB} MB"
+          echo "Will create ${NUM_PARTS} part(s) of approx ${PART_SIZE_MB} MB each"
+          
+          # Get filename from URL
+          FILENAME_FROM_URL=$(basename "$ORIGINAL_URL" | cut -d'?' -f1)
+          if [[ -z "$FILENAME_FROM_URL" || "$FILENAME_FROM_URL" == "/" ]]; then
+            FILENAME_FROM_URL="$DOWNLOADED_FILE"
+          fi
+          
+          # Remove invalid characters for S3 (replace with underscore)
+          SANITIZED_FILENAME=$(echo "$FILENAME_FROM_URL" | sed 's/[?&=%$#@!*;:,<>|\\/]/_/g')
+          
+          FILENAME_BASE=$(echo "$SANITIZED_FILENAME" | sed 's/\.[^.]*$//') 
+          FILENAME_EXT="${SANITIZED_FILENAME##*.}" 
+          
+          if [[ "$FILENAME_BASE" == "$SANITIZED_FILENAME" ]]; then
+            FILENAME_EXT=""
+          fi
+          
+          ARCHIVE_PREFIX="sci-hub.ir_"
+          FULL_ARCHIVE_NAME="${ARCHIVE_PREFIX}${FILENAME_BASE}"
+          
+          # Sanitize again to ensure no invalid chars
+          FULL_ARCHIVE_NAME=$(echo "$FULL_ARCHIVE_NAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
+          
+          MAX_TOTAL_LEN=50
+          CURRENT_LEN=${#FULL_ARCHIVE_NAME}
+          
+          if [[ $CURRENT_LEN -gt $MAX_TOTAL_LEN ]]; then
+            BASE_LEN_TO_KEEP=$((MAX_TOTAL_LEN - ${#ARCHIVE_PREFIX} - ${#FILENAME_EXT} - 1))
+            if [[ $BASE_LEN_TO_KEEP -lt 1 ]]; then BASE_LEN_TO_KEEP=1; fi
+            SHORT_FILENAME_BASE=$(echo "$FILENAME_BASE" | cut -c 1-$BASE_LEN_TO_KEEP)
+            SHORT_FILENAME_BASE=$(echo "$SHORT_FILENAME_BASE" | sed 's/[^a-zA-Z0-9._-]/_/g')
+            FULL_ARCHIVE_NAME="${ARCHIVE_PREFIX}${SHORT_FILENAME_BASE}"
+          fi
+          
+          if [[ -n "$FILENAME_EXT" ]]; then
+            FINAL_ARCHIVE_FILENAME="${FULL_ARCHIVE_NAME}.${FILENAME_EXT}"
+          else
+            FINAL_ARCHIVE_FILENAME="${FULL_ARCHIVE_NAME}"
+          fi
+          
+          echo "Original file name: ${FILENAME_FROM_URL}"
+          echo "Sanitized file name: ${SANITIZED_FILENAME}"
+          echo "Archive base name will be: ${FINAL_ARCHIVE_FILENAME}"
+          
+          echo "archive_base_name=${FULL_ARCHIVE_NAME}" >> $GITHUB_OUTPUT
+          echo "downloaded_file_name=${DOWNLOADED_FILE}" >> $GITHUB_OUTPUT
+          echo "file_extension=${FILENAME_EXT}" >> $GITHUB_OUTPUT
+          echo "final_archive_name=${FINAL_ARCHIVE_FILENAME}" >> $GITHUB_OUTPUT
+          echo "num_parts=${NUM_PARTS}" >> $GITHUB_OUTPUT
+          echo "part_size_mb=${PART_SIZE_MB}" >> $GITHUB_OUTPUT
+
+      - name: Rename downloaded file
+        id: rename_file
+        run: |
+          ARCHIVE_NAME_PREFIX="${{ steps.get_filename.outputs.archive_base_name }}"
+          DOWNLOADED_FILE="${{ steps.get_filename.outputs.downloaded_file_name }}"
+          EXT="${{ steps.get_filename.outputs.file_extension }}"
+          
+          NEW_ORIGINAL_FILENAME="$ARCHIVE_NAME_PREFIX"
+          if [[ -n "$EXT" ]]; then
+            NEW_ORIGINAL_FILENAME="${ARCHIVE_NAME_PREFIX}.${EXT}"
+          fi
+          
+          mv "$DOWNLOADED_FILE" "$NEW_ORIGINAL_FILENAME"
+          echo "Renamed downloaded file to: $NEW_ORIGINAL_FILENAME"
+          echo "new_original_filename=$NEW_ORIGINAL_FILENAME" >> $GITHUB_OUTPUT
+
+      - name: Generate timestamp for unique archive
+        id: timestamp
+        run: echo "value=$(date +%Y%m%d_%H%M%S)" >> $GITHUB_OUTPUT
+
+      - name: Create encrypted split archive (optimized for 2-3 files)
+        id: create_archive
+        run: |
+          ARCHIVE_NAME_PREFIX="${{ steps.get_filename.outputs.archive_base_name }}_${{ steps.timestamp.outputs.value }}"
+          NEW_ORIGINAL_FILENAME="${{ steps.rename_file.outputs.new_original_filename }}"
+          NUM_PARTS="${{ steps.get_filename.outputs.num_parts }}"
+          PART_SIZE_MB="${{ steps.get_filename.outputs.part_size_mb }}"
+          
+          # Ensure archive name has no invalid chars
+          ARCHIVE_NAME_PREFIX=$(echo "$ARCHIVE_NAME_PREFIX" | sed 's/[?&=%$#@!*;:,<>|\\/]/_/g')
+          
+          echo "Creating split archive with optimized settings:"
+          echo "  - Target number of parts: $NUM_PARTS"
+          echo "  - Approximate part size: ${PART_SIZE_MB} MB"
+          
+          # Calculate volume size for 7zip (in bytes, but 7z accepts M suffix)
+          # Use slightly smaller than calculated to ensure we hit the target number
+          if [[ $NUM_PARTS -eq 1 ]]; then
+            # Single file, no splitting
+            echo "Creating single archive (no split)..."
+            7z a -p"${{ github.event.inputs.zip_password }}" -mhe=on -mx=3 "${ARCHIVE_NAME_PREFIX}.7z" "$NEW_ORIGINAL_FILENAME"
+          else
+            # Calculate volume size: file_size / num_parts, rounded down
+            FILE_SIZE_BYTES=$(stat -c%s "$NEW_ORIGINAL_FILENAME")
+            TARGET_VOLUME_BYTES=$((FILE_SIZE_BYTES / NUM_PARTS))
+            TARGET_VOLUME_MB=$((TARGET_VOLUME_BYTES / 1024 / 1024))
+            
+            # Add 10% buffer to ensure we don't exceed num_parts
+            VOLUME_SIZE_MB=$((TARGET_VOLUME_MB + (TARGET_VOLUME_MB / 10)))
+            
+            echo "  - File size: $((FILE_SIZE_BYTES / 1024 / 1024)) MB"
+            echo "  - Target volume size: ${VOLUME_SIZE_MB} MB"
+            echo "  - Expected parts: ~$NUM_PARTS"
+            
+            # Create split archive with calculated volume size
+            7z a -p"${{ github.event.inputs.zip_password }}" -mhe=on -mx=3 -v${VOLUME_SIZE_MB}m "${ARCHIVE_NAME_PREFIX}.7z" "$NEW_ORIGINAL_FILENAME"
+          fi
+          
+          echo "archive_prefix=${ARCHIVE_NAME_PREFIX}" >> $GITHUB_OUTPUT
+          
+          # Count how many parts were actually created
+          PART_COUNT=0
+          for file in ${ARCHIVE_NAME_PREFIX}.7z*; do
+            if [[ -f "$file" ]]; then
+              PART_COUNT=$((PART_COUNT + 1))
+            fi
+          done
+          echo "actual_parts=${PART_COUNT}" >> $GITHUB_OUTPUT
+          echo "Created ${PART_COUNT} archive part(s)"
+
+      - name: Remove original downloaded file
+        run: |
+          FILE="${{ steps.rename_file.outputs.new_original_filename }}"
+          if [[ -n "$FILE" && -f "$FILE" ]]; then
+            rm "$FILE"
+          fi
+
+      - name: Upload archive chunks to S3
+        run: |
+          ARCHIVE_PREFIX="${{ steps.create_archive.outputs.archive_prefix }}"
+          BUCKET_NAME="${{ github.event.inputs.bucket_name }}"
+          ENDPOINT_URL="${{ secrets.S3_ENDPOINT_URL }}"
+          ACTUAL_PARTS="${{ steps.create_archive.outputs.actual_parts }}"
+          
+          echo "========================================="
+          echo "Uploading to S3"
+          echo "========================================="
+          echo "Archive prefix: $ARCHIVE_PREFIX"
+          echo "Bucket: $BUCKET_NAME"
+          echo "Endpoint: $ENDPOINT_URL"
+          echo "Total parts: $ACTUAL_PARTS"
+          echo ""
+          
+          # List files to upload
+          echo "Files to upload:"
+          for file in ${ARCHIVE_PREFIX}.7z*; do
+            if [[ -f "$file" ]]; then
+              echo "  - $file ($(ls -lh "$file" | awk '{print $5}'))"
+            fi
+          done
+          
+          echo ""
+          echo "Starting upload..."
+          
+          # Upload all split archive files to bucket root
+          SUCCESS_COUNT=0
+          for file in ${ARCHIVE_PREFIX}.7z*; do
+            if [[ -f "$file" ]]; then
+              echo "Uploading: $file to s3://$BUCKET_NAME/"
+              
+              # Upload with endpoint URL
+              if s5cmd --endpoint-url "$ENDPOINT_URL" cp "$file" "s3://$BUCKET_NAME/"; then
+                echo "✓ Successfully uploaded: $file"
+                SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+              else
+                echo "✗ Failed to upload: $file"
+                echo ""
+                echo "Troubleshooting tips:"
+                echo "1. Verify bucket '$BUCKET_NAME' exists"
+                echo "2. Check that your Access Key has write permission"
+                echo "3. Endpoint URL: $ENDPOINT_URL"
+                exit 1
+              fi
+            fi
+          done
+          
+          echo ""
+          echo "✓ All ${SUCCESS_COUNT} archive parts uploaded successfully to s3://$BUCKET_NAME/"
+
+      - name: Verify upload
+        run: |
+          ARCHIVE_PREFIX="${{ steps.create_archive.outputs.archive_prefix }}"
+          BUCKET_NAME="${{ github.event.inputs.bucket_name }}"
+          ENDPOINT_URL="${{ secrets.S3_ENDPOINT_URL }}"
+          ACTUAL_PARTS="${{ steps.create_archive.outputs.actual_parts }}"
+          
+          echo "Verifying upload to S3..."
+          s5cmd --endpoint-url "$ENDPOINT_URL" ls "s3://$BUCKET_NAME/$ARCHIVE_PREFIX.7z*"
+          
+          echo "## Upload Complete! 📦" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Files uploaded to S3 bucket: \`$BUCKET_NAME\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Archive prefix:** \`$ARCHIVE_PREFIX\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Number of parts:** \`$ACTUAL_PARTS\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Endpoint:** $ENDPOINT_URL" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ $ACTUAL_PARTS -le 3 ]]; then
+            echo "✅ Successfully created only $ACTUAL_PARTS file(s) as requested!" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "ℹ️ Created $ACTUAL_PARTS parts (optimized for size limits)" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Cleanup local archive files
+        run: |
+          ARCHIVE_PREFIX="${{ steps.create_archive.outputs.archive_prefix }}"
+          rm -f ${ARCHIVE_PREFIX}.7z*
+          echo "Local archive files cleaned up"
